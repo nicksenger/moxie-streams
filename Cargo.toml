@@ -1,0 +1,9 @@
+[package]
+name = "moxie_streams"
+version = "0.1.0"
+authors = ["Nick Senger <dev@nsenger.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "^0.3.6"
+moxie = "^0.7.0"
