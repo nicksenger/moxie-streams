@@ -1,4 +1,4 @@
-# moxie_streams
+# moxie-streams
 
 Manage moxie state and side effects using reducers and streams.
 
