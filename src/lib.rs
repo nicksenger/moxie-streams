@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use futures::{channel::mpsc, future::ready, stream::Stream, StreamExt};
 use moxie::{load_once, once, state, Commit};
@@ -92,13 +91,11 @@ where
     let (current_state, accessor) = state(|| initial_state);
 
     let dispatch = once(|| {
-        let r = Rc::new(reducer);
-
         let (action_producer, action_consumer): (
             mpsc::UnboundedSender<Msg>,
             mpsc::UnboundedReceiver<Msg>,
         ) = mpsc::unbounded();
-        let p = Rc::new(RefCell::new(action_producer));
+        let p = Arc::new(Mutex::new(action_producer));
         let pc = p.clone();
 
         let (mut operated_action_producer, operated_action_consumer): (
@@ -108,7 +105,7 @@ where
 
         let _ = load_once(move || {
             action_consumer.for_each(move |msg| {
-                accessor.update(|cur| Some(r(cur, msg.clone())));
+                accessor.update(|cur| Some(reducer(cur, msg.clone())));
                 let _ = operated_action_producer.start_send(msg);
                 ready(())
             })
@@ -116,12 +113,14 @@ where
 
         let _ = load_once(move || {
             operator(operated_action_consumer).for_each(move |msg| {
-                let _ = pc.borrow_mut().start_send(msg);
+                let _ = pc.lock().unwrap().start_send(msg);
                 ready(())
             })
         });
 
-        move |msg| { let _ = p.borrow_mut().start_send(msg); }
+        move |msg| {
+            let _ = p.lock().unwrap().start_send(msg);
+        }
     });
 
     (current_state, dispatch)
