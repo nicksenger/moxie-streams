@@ -85,7 +85,7 @@ pub fn mox_stream<State: 'static, Msg: 'static + Clone, OutStream>(
     initial_state: State,
     reducer: impl Fn(&State, Msg) -> State + 'static,
     operator: impl FnOnce(mpsc::UnboundedReceiver<Msg>) -> OutStream,
-) -> (Commit<State>, Rc<impl Fn(Msg)>)
+) -> (Commit<State>, impl Fn(Msg))
 where
     OutStream: Stream<Item = Msg> + 'static,
 {
@@ -121,9 +121,7 @@ where
             })
         });
 
-        Rc::new(move |msg| {
-            let _ = p.borrow_mut().start_send(msg);
-        })
+        move |msg| { let _ = p.borrow_mut().start_send(msg); }
     });
 
     (current_state, dispatch)
