@@ -1,3 +1,5 @@
+cargo-features = ["public-dependency"]
+
 [package]
 name = "moxie-streams"
 version = "0.1.0"
@@ -6,4 +8,4 @@ edition = "2018"
 
 [dependencies]
 futures = "^0.3.6"
-moxie = { git = "https://github.com/anp/moxie" }
+moxie = { git = "https://github.com/anp/moxie", public = true }
