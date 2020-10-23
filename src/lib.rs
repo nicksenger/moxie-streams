@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use futures::{channel::mpsc, future::ready, stream::Stream, StreamExt};
 use moxie::{load_once, once, state, Commit};
 
-/// Root a state variable at the callsite, returning a `Rc<dispatch>` which may be used to send messages
-/// to be processed by the provided `reducer` and `operator`.
+/// Root a state variable at the callsite, returning a `dispatch` function which may be used to send
+/// messages to be processed by the provided `reducer` and `operator`.
 ///
 /// For each message dispatched, the provided `reducer` will be invoked with a reference to the current
 /// state and the message. The state will then be updated with the return value from the `reducer`.
