@@ -8,4 +8,4 @@ edition = "2018"
 
 [dependencies]
 futures = "^0.3.6"
-moxie = { git = "https://github.com/anp/moxie", public = true }
+moxie = { git = "https://github.com/anp/moxie", public = true, branch = "main" }
