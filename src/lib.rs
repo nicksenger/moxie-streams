@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use futures::{channel::mpsc, future::ready, stream::Stream, StreamExt};
@@ -34,7 +35,7 @@ use moxie::{load_once, once, state, Commit};
 /// let mut rt = RunLoop::new(|| {
 ///     mox_stream(
 ///         State { pings: 0, pongs: 0 },
-///         |state, msg| match msg {
+///         |state, msg| match *msg {
 ///             Msg::Ping => State {
 ///                 pings: state.pings + 1,
 ///                 pongs: state.pongs,
@@ -47,7 +48,7 @@ use moxie::{load_once, once, state, Commit};
 ///         |in_stream| {
 ///             in_stream
 ///                 .filter(|msg| {
-///                     ready(match msg {
+///                     ready(match **msg {
 ///                         Msg::Ping => true,
 ///                         _ => false,
 ///                     })
@@ -80,10 +81,10 @@ use moxie::{load_once, once, state, Commit};
 /// assert_eq!(third_commit.pings, 1);
 /// assert_eq!(third_commit.pongs, 2);
 /// ```
-pub fn mox_stream<State: 'static, Msg: 'static + Clone, OutStream>(
+pub fn mox_stream<State: 'static, Msg: 'static, OutStream>(
     initial_state: State,
-    reducer: impl Fn(&State, Msg) -> State + 'static,
-    operator: impl FnOnce(mpsc::UnboundedReceiver<Msg>) -> OutStream,
+    reducer: impl Fn(&State, Rc<Msg>) -> State + 'static,
+    operator: impl FnOnce(mpsc::UnboundedReceiver<Rc<Msg>>) -> OutStream,
 ) -> (Commit<State>, impl Fn(Msg))
 where
     OutStream: Stream<Item = Msg> + 'static,
@@ -99,14 +100,15 @@ where
         let pc = p.clone();
 
         let (mut operated_action_producer, operated_action_consumer): (
-            mpsc::UnboundedSender<Msg>,
-            mpsc::UnboundedReceiver<Msg>,
+            mpsc::UnboundedSender<Rc<Msg>>,
+            mpsc::UnboundedReceiver<Rc<Msg>>,
         ) = mpsc::unbounded();
 
         let _ = load_once(move || {
             action_consumer.for_each(move |msg| {
-                accessor.update(|cur| Some(reducer(cur, msg.clone())));
-                let _ = operated_action_producer.start_send(msg);
+                let mrc = Rc::new(msg);
+                accessor.update(|cur| Some(reducer(cur, mrc.clone())));
+                let _ = operated_action_producer.start_send(mrc);
                 ready(())
             })
         });
@@ -126,6 +128,39 @@ where
     (current_state, dispatch)
 }
 
+#[macro_export]
+macro_rules! combine_operators {
+    ( $( $x:expr ),* ) => {
+        {
+            let mut in_producers = vec![];
+            let (mut out_producer, out_consumer): (
+                mpsc::UnboundedSender<Msg>,
+                mpsc::UnboundedReceiver<Msg>,
+            ) = mpsc::unbounded();
+            $(
+                let (p, c): (
+                    mpsc::UnboundedSender<Rc<Msg>>,
+                    mpsc::UnboundedReceiver<Rc<Msg>>,
+                ) = mpsc::unbounded();
+                ($x)(c).for_each(|msg| {
+                    let _ = out_producer.start_send(msg);
+                    ready(())
+                });
+                in_producers.push(p);
+            )*
+            move |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
+                in_stream.for_each(|mrc| {
+                    in_producers.iter_mut().for_each(|p| {
+                        let _ = p.start_send(mrc.clone());
+                    });
+                    ready(())
+                });
+                out_consumer
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,14 +175,32 @@ mod tests {
             Decrement,
         }
 
+        let op1 = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
+            in_stream
+                .filter(|mrc| match **mrc {
+                    Msg::Increment => ready(true),
+                    _ => ready(false)
+                })
+                .map(|mrc| Msg::Decrement)
+        };
+        let op2 = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
+            in_stream
+                .filter(|mrc| match **mrc {
+                    Msg::Decrement => ready(true),
+                    _ => ready(false)
+                })
+                .map(|mrc| Msg::Increment)
+        };
+        let op = combine_operators!(op1, op2);
+
         let mut rt = RunLoop::new(|| {
             mox_stream(
                 0,
-                |state, msg| match msg {
+                |state, msg| match *msg {
                     Msg::Increment => state + 1,
                     Msg::Decrement => state - 1,
                 },
-                |in_stream| in_stream.filter(|_| ready(false)),
+                |in_stream| in_stream.filter(|_| ready(false)).map(|_| Msg::Decrement),
             )
         });
 
@@ -188,7 +241,7 @@ mod tests {
         let mut rt = RunLoop::new(|| {
             mox_stream(
                 State { pings: 0, pongs: 0 },
-                |state, msg| match msg {
+                |state, msg| match *msg {
                     Msg::Ping => State {
                         pings: state.pings + 1,
                         pongs: state.pongs,
@@ -201,7 +254,7 @@ mod tests {
                 |in_stream| {
                     in_stream
                         .filter(|msg| {
-                            ready(match msg {
+                            ready(match **msg {
                                 Msg::Ping => true,
                                 _ => false,
                             })
