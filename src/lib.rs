@@ -1,5 +1,5 @@
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 use futures::{channel::mpsc, future::ready, stream::Stream, StreamExt};
 use moxie::{load_once, once, state, Commit};
@@ -45,7 +45,7 @@ use moxie::{load_once, once, state, Commit};
 ///                 pongs: state.pongs + 1,
 ///             },
 ///         },
-///         |in_stream| {
+///         || Box::new(|in_stream| {
 ///             in_stream
 ///                 .filter(|msg| {
 ///                     ready(match **msg {
@@ -54,7 +54,7 @@ use moxie::{load_once, once, state, Commit};
 ///                     })
 ///                 })
 ///                 .map(|_| Msg::Pong)
-///         },
+///         }),
 ///     )
 /// });
 ///
@@ -84,7 +84,7 @@ use moxie::{load_once, once, state, Commit};
 pub fn mox_stream<State: 'static, Msg: 'static, OutStream>(
     initial_state: State,
     reducer: impl Fn(&State, Rc<Msg>) -> State + 'static,
-    operator: impl FnOnce(mpsc::UnboundedReceiver<Rc<Msg>>) -> OutStream,
+    get_operator: impl Fn() -> Box<dyn FnOnce(mpsc::UnboundedReceiver<Rc<Msg>>) -> OutStream>,
 ) -> (Commit<State>, impl Fn(Msg))
 where
     OutStream: Stream<Item = Msg> + 'static,
@@ -96,7 +96,7 @@ where
             mpsc::UnboundedSender<Msg>,
             mpsc::UnboundedReceiver<Msg>,
         ) = mpsc::unbounded();
-        let p = Arc::new(Mutex::new(action_producer));
+        let p = Rc::new(RefCell::new(action_producer));
         let pc = p.clone();
 
         let (mut operated_action_producer, operated_action_consumer): (
@@ -114,14 +114,14 @@ where
         });
 
         let _ = load_once(move || {
-            operator(operated_action_consumer).for_each(move |msg| {
-                let _ = pc.lock().unwrap().start_send(msg);
+            get_operator()(operated_action_consumer).for_each(move |msg| {
+                let _ = pc.borrow_mut().start_send(msg);
                 ready(())
             })
         });
 
         move |msg| {
-            let _ = p.lock().unwrap().start_send(msg);
+            let _ = p.borrow_mut().start_send(msg);
         }
     });
 
@@ -133,28 +133,30 @@ macro_rules! combine_operators {
     ( $( $x:expr ),* ) => {
         {
             let mut in_producers = vec![];
-            let (mut out_producer, out_consumer): (
-                mpsc::UnboundedSender<Msg>,
-                mpsc::UnboundedReceiver<Msg>,
-            ) = mpsc::unbounded();
+            let (out_producer, out_consumer): (
+                futures::channel::mpsc::UnboundedSender<Msg>,
+                futures::channel::mpsc::UnboundedReceiver<Msg>,
+            ) = futures::channel::mpsc::unbounded();
+            let op = std::rc::Rc::new(std::cell::RefCell::new(out_producer));
             $(
+                let out = op.clone();
                 let (p, c): (
-                    mpsc::UnboundedSender<Rc<Msg>>,
-                    mpsc::UnboundedReceiver<Rc<Msg>>,
-                ) = mpsc::unbounded();
-                ($x)(c).for_each(|msg| {
-                    let _ = out_producer.start_send(msg);
-                    ready(())
-                });
+                    futures::channel::mpsc::UnboundedSender<Rc<Msg>>,
+                    futures::channel::mpsc::UnboundedReceiver<Rc<Msg>>,
+                ) = futures::channel::mpsc::unbounded();
+                let _ = load_once(|| ($x)(c).for_each(move |msg| {
+                    let _ = out.borrow_mut().start_send(msg);
+                    futures::future::ready(())
+                }));
                 in_producers.push(p);
             )*
-            move |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
-                in_stream.for_each(|mrc| {
+            move |in_stream: futures::channel::mpsc::UnboundedReceiver<Rc<Msg>>| {
+                let _ = moxie::load_once(move || in_stream.for_each(move |mrc| {
                     in_producers.iter_mut().for_each(|p| {
                         let _ = p.start_send(mrc.clone());
                     });
-                    ready(())
-                });
+                    futures::future::ready(())
+                }));
                 out_consumer
             }
         }
@@ -175,24 +177,6 @@ mod tests {
             Decrement,
         }
 
-        let op1 = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
-            in_stream
-                .filter(|mrc| match **mrc {
-                    Msg::Increment => ready(true),
-                    _ => ready(false)
-                })
-                .map(|mrc| Msg::Decrement)
-        };
-        let op2 = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
-            in_stream
-                .filter(|mrc| match **mrc {
-                    Msg::Decrement => ready(true),
-                    _ => ready(false)
-                })
-                .map(|mrc| Msg::Increment)
-        };
-        let op = combine_operators!(op1, op2);
-
         let mut rt = RunLoop::new(|| {
             mox_stream(
                 0,
@@ -200,7 +184,7 @@ mod tests {
                     Msg::Increment => state + 1,
                     Msg::Decrement => state - 1,
                 },
-                |in_stream| in_stream.filter(|_| ready(false)).map(|_| Msg::Decrement),
+                || Box::new(|in_stream| in_stream.filter(|_| ready(false)).map(|_| Msg::Decrement)),
             )
         });
 
@@ -251,15 +235,17 @@ mod tests {
                         pongs: state.pongs + 1,
                     },
                 },
-                |in_stream| {
-                    in_stream
-                        .filter(|msg| {
-                            ready(match **msg {
-                                Msg::Ping => true,
-                                _ => false,
+                || {
+                    Box::new(|in_stream| {
+                        in_stream
+                            .filter(|msg| {
+                                ready(match **msg {
+                                    Msg::Ping => true,
+                                    _ => false,
+                                })
                             })
-                        })
-                        .map(|_| Msg::Pong)
+                            .map(|_| Msg::Pong)
+                    })
                 },
             )
         });
@@ -286,5 +272,92 @@ mod tests {
         let (third_commit, _) = rt.run_once();
         assert_eq!(third_commit.pings, 1);
         assert_eq!(third_commit.pongs, 2);
+    }
+
+    #[test]
+    fn combine_operator() {
+        #[derive(Clone)]
+        enum Msg {
+            Tic,
+            Tac,
+            Toe,
+        }
+
+        struct State {
+            tic: usize,
+            tac: usize,
+            toe: usize,
+        }
+
+        let tic_operator = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
+            in_stream
+                .filter(|mrc| match **mrc {
+                    Msg::Tic => ready(true),
+                    _ => ready(false),
+                })
+                .map(|_| Msg::Tac)
+        };
+        let tac_operator = |in_stream: mpsc::UnboundedReceiver<Rc<Msg>>| {
+            in_stream
+                .filter(|mrc| match **mrc {
+                    Msg::Tac => ready(true),
+                    _ => ready(false),
+                })
+                .map(|_| Msg::Toe)
+        };
+
+        let mut rt = RunLoop::new(|| {
+            mox_stream(
+                State {
+                    tic: 0,
+                    tac: 0,
+                    toe: 0,
+                },
+                |state, msg| match *msg {
+                    Msg::Tic => State {
+                        tic: state.tic + 1,
+                        tac: state.tac,
+                        toe: state.toe,
+                    },
+                    Msg::Tac => State {
+                        tic: state.tic,
+                        tac: state.tac + 1,
+                        toe: state.toe,
+                    },
+                    Msg::Toe => State {
+                        tic: state.tic,
+                        tac: state.tac,
+                        toe: state.toe + 1,
+                    },
+                },
+                || Box::new(combine_operators!(tic_operator, tac_operator)),
+            )
+        });
+
+        let mut exec = LocalPool::new();
+        rt.set_task_executor(exec.spawner());
+
+        exec.run_until_stalled();
+
+        let (first_commit, dispatch) = rt.run_once();
+        assert_eq!(first_commit.tic, 0);
+        assert_eq!(first_commit.tac, 0);
+        assert_eq!(first_commit.toe, 0);
+
+        dispatch(Msg::Toe);
+        exec.run_until_stalled();
+
+        let (second_commit, _) = rt.run_once();
+        assert_eq!(second_commit.tic, 0);
+        assert_eq!(second_commit.tac, 0);
+        assert_eq!(second_commit.toe, 1);
+
+        dispatch(Msg::Tic);
+        exec.run_until_stalled();
+
+        let (third_commit, _) = rt.run_once();
+        assert_eq!(third_commit.tic, 1);
+        assert_eq!(third_commit.tac, 1);
+        assert_eq!(third_commit.toe, 2);
     }
 }
